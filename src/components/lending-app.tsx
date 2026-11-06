@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ArrowDownLeft, ArrowUpRight, ArrowRight, CalendarDays, CalendarCheck, Check, CheckCircle2, ChevronLeft, ChevronRight, CircleHelp, CreditCard, Download, Files, LayoutDashboard, Menu, Plus, Search, Settings2, Sparkles, TrendingUp, Users, Wallet, X, RotateCcw, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -38,6 +38,13 @@ function Field({ label, children, hint }: { label: string; children: ReactNode; 
 export function LendingApp() {
   const [store, setStore] = useState<Store>(() => createDemo());
   const [ready, setReady] = useState(false);
+  const [persistence, setPersistence] = useState<"browser" | "postgres">("browser");
+  const [saving, setSaving] = useState(false);
+  const revision = useRef(0);
+  const lastQueuedStore = useRef<Store | null>(null);
+  const saveQueue = useRef(Promise.resolve());
+  const pendingSaves = useRef(0);
+  const databaseBlocked = useRef(false);
   const [page, setPage] = useState<Page>("dashboard");
   const [mobileNav, setMobileNav] = useState(false);
   const [date, setDate] = useState(todayISO);
@@ -55,15 +62,56 @@ export function LendingApp() {
   const unpaid = all.filter(s => s.remaining > 0 && s.date < today);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORE_KEY);
-      if (raw) { const parsed: unknown = JSON.parse(raw); if (isStore(parsed)) setStore(parsed); else setStorageError("Saved demo data could not be restored. A fresh set of sample records is shown."); }
-    } catch { setStorageError("Browser storage is unavailable. Changes will last for this visit only."); }
-    const hash = window.location.hash.slice(1);
-    if ([...nav.map(n => n.id), "settings"].includes(hash)) setPage(hash as Page);
-    setReady(true);
+    let cancelled = false;
+    async function load() {
+      try {
+        const response = await fetch("/api/state", { cache: "no-store" });
+        if (!response.ok) throw new Error("The demo database is temporarily unavailable. Changes will stay in this browser until you reload.");
+        const data = await response.json();
+        if (cancelled) return;
+        if (data.mode === "postgres" && isStore(data.store)) {
+          revision.current = data.revision;
+          lastQueuedStore.current = data.store;
+          setStore(data.store);
+          setPersistence("postgres");
+        } else {
+          const raw = localStorage.getItem(STORE_KEY);
+          if (raw) {
+            const parsed: unknown = JSON.parse(raw);
+            if (isStore(parsed)) setStore(parsed);
+            else setStorageError("Saved demo data could not be restored. A fresh set of sample records is shown.");
+          }
+        }
+      } catch (error) {
+        if (!cancelled) setStorageError(error instanceof Error ? error.message : "The demo could not be restored. Changes will last for this visit only.");
+      }
+      if (cancelled) return;
+      const hash = window.location.hash.slice(1);
+      if ([...nav.map(n => n.id), "settings"].includes(hash)) setPage(hash as Page);
+      setReady(true);
+    }
+    void load();
+    return () => { cancelled = true; };
   }, []);
-  useEffect(() => { if (ready) { try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch { setStorageError("Changes could not be saved in this browser. Keep this tab open to retain your demo."); } } }, [store, ready]);
+  useEffect(() => {
+    if (!ready) return;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
+    catch { if (persistence === "browser") setStorageError("Changes could not be saved in this browser. Keep this tab open to retain your demo."); }
+    if (persistence !== "postgres" || lastQueuedStore.current === store || databaseBlocked.current) return;
+    lastQueuedStore.current = store;
+    pendingSaves.current += 1;
+    setSaving(true);
+    saveQueue.current = saveQueue.current.then(async () => {
+      if (databaseBlocked.current) return;
+      const response = await fetch("/api/state", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ store, revision: revision.current }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Changes could not be saved. Keep this tab open and try reloading later.");
+      revision.current = data.revision;
+    }).catch(error => {
+      databaseBlocked.current = true;
+      setStorageError(error instanceof Error ? error.message : "Changes could not be saved to the database. Keep this tab open.");
+    }).finally(() => { pendingSaves.current -= 1; if (!pendingSaves.current) setSaving(false); });
+  }, [store, ready, persistence]);
   useEffect(() => { if (!toast) return; const timeout = setTimeout(() => setToast(""), 4200); return () => clearTimeout(timeout); }, [toast]);
 
   function navigate(next: Page) { setPage(next); setQuery(""); setMobileNav(false); window.history.replaceState(null, "", `#${next}`); }
@@ -107,7 +155,7 @@ export function LendingApp() {
       <nav aria-label="Main navigation">{nav.map(n => <button key={n.id} onClick={() => navigate(n.id)} className={cn("nav-item", page === n.id && "active")} aria-current={page === n.id ? "page" : undefined}><n.icon size={18} /><span>{n.label}</span>{n.id === "collections" && unpaid.length > 0 && <span className="nav-count">{unpaid.length}</span>}</button>)}</nav>
       <div className="sidebar-bottom"><div className="demo-note"><span className="mini-spark"><Sparkles size={17} /></span><strong>A little possibility.</strong><p>A lot of room to grow.</p><span>CLIENT DEMO</span></div><button className={cn("nav-item", page === "settings" && "active")} onClick={() => navigate("settings")}><Settings2 size={18} /><span>Settings</span></button><div className="sidebar-profile"><span className="profile-avatar">AL</span><div><strong>Alex Lopez</strong><small>Demo workspace</small></div><span className="online-dot" /></div></div>
     </aside>
-    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><Button variant="ghost" size="icon" className="mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu /></Button><span>Workspace</span><ChevronRight size={13} /><strong>{page === "dashboard" ? "Overview" : page[0].toUpperCase() + page.slice(1)}</strong></div><div className="topbar-right"><span className="demo-pill"><span />Demo mode</span><button className="icon-button" aria-label="About this demo" onClick={() => notify("All records are fictional. Changes are saved only in this browser. Use Settings to reset the demo.")}><CircleHelp size={18} /></button><span className="topbar-divider" /><span className="profile-avatar small">AL</span></div></header>
+    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><Button variant="ghost" size="icon" className="mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu /></Button><span>Workspace</span><ChevronRight size={13} /><strong>{page === "dashboard" ? "Overview" : page[0].toUpperCase() + page.slice(1)}</strong></div><div className="topbar-right"><span className="demo-pill"><span />Demo mode</span><button className="icon-button" aria-label="About this demo" onClick={() => notify("All records are fictional. Each browser has its own demo workspace. Use Settings to reset your sample data.")}><CircleHelp size={18} /></button><span className="topbar-divider" /><span className="profile-avatar small">AL</span></div></header>
     <main className="workspace-main">
       {storageError && <div className="storage-alert" role="alert">{storageError}</div>}
       <section className="hero"><div className="hero-content"><div className="eyebrow"><span />{titles[page][0]}</div><h1>{titles[page][1]}</h1><p>{titles[page][2]}</p></div><div className="hero-side"><span className="hero-sticker"><Sparkles size={14} /> MADE FOR MOMENTUM</span>{page !== "settings" && page !== "releases" && <Button className="hero-button" onClick={pageAction}><Plus size={16} />{page === "customers" ? "Add customer" : page === "collections" ? "Record collection" : "Create loan"}</Button>}</div><div className="hero-orbit" aria-hidden="true" /></section>
@@ -135,7 +183,7 @@ export function LendingApp() {
       {page === "releases" && <><div className="stats-grid"><Stat label="Ready to release" value={money(awaiting.reduce((n, l) => n + l.principal, 0))} detail={`${awaiting.length} approved loans awaiting funds`} icon={ArrowUpRight} color="peach" /><Stat label="Released this month" value={money(store.loans.filter(l => l.releasedAt?.startsWith(today.slice(0, 7))).reduce((n, l) => n + l.principal, 0))} detail="Principal disbursed this calendar month" icon={CheckCircle2} color="mint" /><Stat label="Total released" value={money(store.loans.filter(l => l.status === "Released").reduce((n, l) => n + l.principal, 0))} detail={`${store.loans.filter(l => l.status === "Released").length} released loans · all time`} icon={Wallet} color="lavender" /></div><section className="panel"><div className="panel-heading"><div><h2>Ready when you are <span className="count-pill">{awaiting.length}</span></h2><p>Releasing a loan creates its collection schedule.</p></div></div>{awaiting.length ? <div className="release-cards">{awaiting.map(l => { const c = store.customers.find(c => c.id === l.customerId)!; return <article className="release-card" key={l.id}><div className="release-card-top"><span className="person-avatar avatar-2">{initials(c.name)}</span><Status value="Approved" /></div><button className="release-customer" onClick={() => setCustomerId(c.id)}>{c.name}</button><p>{l.id} · {c.business}</p><strong className="release-amount">{money(l.principal)}</strong><div className="release-terms"><span>{l.ratePercent}% flat interest</span><span>{l.installments} {l.frequency.toLowerCase()} payments</span></div><Button className="w-full" onClick={() => setModal({ kind: "release", loan: l })}>Release funds <ArrowUpRight /></Button></article>; })}</div> : <Empty title="All caught up." text="Every approved loan has been released. New loans will appear here." />}</section><section className="panel spaced-panel"><div className="panel-heading"><div><h2>Release history</h2><p>Funds that have already found their way.</p></div></div><div className="table-scroll"><table><thead><tr><th>Customer / loan</th><th>Release date</th><th>Method</th><th className="num">Amount released</th></tr></thead><tbody>{store.loans.filter(l => l.status === "Released").sort((a, b) => b.releasedAt!.localeCompare(a.releasedAt!)).map(l => { const c = store.customers.find(c => c.id === l.customerId)!; return <tr key={l.id}><td><button className="person-cell" onClick={() => setCustomerId(c.id)}><span><strong>{c.name}</strong><small>{l.id}</small></span></button></td><td className="muted">{formatDate(l.releasedAt!)}</td><td className="muted">{store.paymentTypes.find(t => t.id === l.releaseMethod)?.name || "—"}</td><td className="num">{money(l.principal)}</td></tr>; })}</tbody></table></div></section></>}
 
       {page === "settings" && <><div className="settings-grid"><section className="panel"><div className="panel-heading"><div><h2>Interest rates</h2><p>One flat rate for the whole loan term.</p></div><Button size="sm" onClick={() => setModal({ kind: "rate" })}><Plus />Add rate</Button></div><div className="setting-list">{store.rates.map(r => <div className="setting-item" key={r.id}><span className="setting-icon"><TrendingUp size={19} /></span><div><strong>{r.name}</strong><p>{r.percent}% flat · full term</p></div><button role="switch" aria-checked={r.active} aria-label={`${r.name} rate active`} className={cn("toggle", r.active && "on")} onClick={() => setStore({ ...store, rates: store.rates.map(t => t.id === r.id ? { ...t, active: !t.active } : t) })}><span /></button></div>)}</div><div className="settings-note">Rates are copied onto new loans. Changing availability won’t change existing loans.</div></section><section className="panel"><div className="panel-heading"><div><h2>Payment types</h2><p>How money moves in and out.</p></div><Button size="sm" onClick={() => setModal({ kind: "method" })}><Plus />Add type</Button></div><div className="setting-list">{store.paymentTypes.map(t => <div className="setting-item" key={t.id}><span className="setting-icon peach-icon"><CreditCard size={19} /></span><div><strong>{t.name}</strong><p>{t.active ? "Available for payments and releases" : "Hidden from new transactions"}</p></div><button role="switch" aria-checked={t.active} aria-label={`${t.name} payment type active`} className={cn("toggle", t.active && "on")} onClick={() => setStore({ ...store, paymentTypes: store.paymentTypes.map(p => p.id === t.id ? { ...p, active: !p.active } : p) })}><span /></button></div>)}</div></section></div><section className="panel demo-settings"><div><h2>A fresh start for your next demo.</h2><p>Reset this browser’s sample customers, loans, and payments. Only fictional demo records belong here.</p></div><Button variant="outline" onClick={() => setModal({ kind: "reset" })}><RotateCcw />Reset demo data</Button></section></>}
-      <footer className="workspace-footer"><span><span className="footer-logo">luma</span> A little clarity goes a long way.</span><span>Fictional data · Saved in this browser</span></footer>
+      <footer className="workspace-footer"><span><span className="footer-logo">luma</span> A little clarity goes a long way.</span><span>Fictional data · {saving ? "Saving changes…" : persistence === "postgres" ? "PostgreSQL connected" : "Saved in this browser"}</span></footer>
     </main></div>
     <Dialog open={!!customer} onOpenChange={open => { if (!open) setCustomerId(null); }}><DialogContent side><DialogHeader><span className="eyebrow purple-text">THE WHOLE PICTURE</span><DialogTitle>Customer details</DialogTitle><DialogDescription>Profile, loans, and payment history in one place.</DialogDescription></DialogHeader>{customer && <CustomerDetails customer={customer} store={store} all={all} onLoan={() => { setCustomerId(null); setModal({ kind: "loan", customerId: customer.id }); }} onCollect={s => { setCustomerId(null); setModal({ kind: "payment", entry: s }); }} />}</DialogContent></Dialog>
     <Dialog open={!!modal} onOpenChange={open => { if (!open) setModal(null); }}><DialogContent className={modal?.kind === "loan" ? "loan-dialog" : ""}>{modal && <DemoForm key={modal.kind + ("entry" in modal ? modal.entry.id : "loan" in modal ? modal.loan.id : "")} modal={modal} store={store} onCommit={commit} onCancel={() => setModal(null)} />}</DialogContent></Dialog>
@@ -192,7 +240,7 @@ function DemoForm({ modal, store, onCommit, onCancel }: { modal: Modal; store: S
     payment: ["One more step forward.", "Record a full or partial payment against this installment."],
     rate: ["Keep your rates simple.", "This flat percentage applies once to the full principal for the entire loan term."],
     method: ["Another way to pay.", "Add a payment type for collections and releases."],
-    reset: ["Start fresh?", "This replaces this browser’s demo records with a fresh set of fictional data. Your added records will be removed."],
+    reset: ["Start fresh?", "This replaces your demo workspace’s records with a fresh set of fictional data. Your added records will be removed."],
   };
   function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault(); setError(""); const data = new FormData(e.currentTarget); const value = (key: string) => String(data.get(key) || "").trim();
